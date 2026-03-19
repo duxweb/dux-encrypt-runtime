@@ -1,0 +1,23 @@
+{
+    "name": "duxweb/dux-encrypt-runtime",
+    "description": "Runtime for executing dux-encrypt protected PHP bundles without extensions.",
+    "type": "library",
+    "license": "proprietary",
+    "autoload": {
+        "psr-4": {
+            "DuxEncrypt\\": "src/"
+        },
+        "files": [
+            "bootstrap.php"
+        ]
+    },
+    "require": {
+        "php": "^7.4 || ^8.0"
+    },
+    "keywords": [
+        "php",
+        "encryption",
+        "runtime",
+        "source-protection"
+    ]
+}
