@@ -6,6 +6,7 @@ namespace DuxEncrypt;
 
 final class Runtime
 {
+    private static array $config = [];
     private static array $manifestCache = [];
     private static array $programCache = [];
     private static array $payloadKeyCache = [];
@@ -17,6 +18,11 @@ final class Runtime
     private static array $functionInvokerCache = [];
     private static array $staticInvokerCache = [];
     private static array $methodInvokerCache = [];
+
+    public static function configure(array $config): void
+    {
+        self::$config = array_replace_recursive(self::$config, $config);
+    }
 
     public static function execute(string $manifestPath, string $payloadId, string $currentFile)
     {
@@ -321,7 +327,7 @@ final class Runtime
         if ($ciphertext == '' || $salt == '') {
             return '';
         }
-        $secret = (string)($_SERVER['DUX_ENCRYPT_RUNTIME_SECRET'] ?? getenv('DUX_ENCRYPT_RUNTIME_SECRET') ?: '');
+        $secret = self::runtimeSecret($manifest);
         if ($secret == '') {
             throw new \RuntimeException('Runtime secret missing');
         }
@@ -388,7 +394,7 @@ final class Runtime
                 @opcache_compile_file($cachePath);
             }
             require_once $cachePath;
-            if ((string)($_SERVER['DUX_ENCRYPT_EPHEMERAL_CACHE'] ?? getenv('DUX_ENCRYPT_EPHEMERAL_CACHE') ?: '') !== '') {
+            if (self::ephemeralCacheEnabled()) {
                 @unlink($cachePath);
             }
             self::$jitLoaded[$cachePath] = true;
@@ -447,7 +453,7 @@ final class Runtime
 
     private static function jitCachePath(string $manifestPath, string $payloadId, array $program): string
     {
-        $base = (string)($_SERVER['DUX_ENCRYPT_CACHE_DIR'] ?? getenv('DUX_ENCRYPT_CACHE_DIR') ?: sys_get_temp_dir() . '/dux-encrypt-cache');
+        $base = self::cacheDir();
         if (!is_dir($base)) {
             @mkdir($base, 0700, true);
         }
@@ -534,7 +540,7 @@ final class Runtime
             }
             self::verifyManifestIntegrity($manifest);
             $manifest['__license_cache_seed'] = sha1(json_encode($manifest['license'] ?? [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '');
-            $manifest['__has_license'] = is_array($manifest['license'] ?? null) && is_array(($manifest['license']['payload'] ?? null));
+            $manifest['__has_license'] = is_array($manifest['license'] ?? null) && $manifest['license'] !== [];
             self::$manifestCache[$manifestPath] = $manifest;
         }
         return self::$manifestCache[$manifestPath];
@@ -547,7 +553,7 @@ final class Runtime
         if ($hmac === '' || $salt === '') {
             return;
         }
-        $secret = (string)($_SERVER['DUX_ENCRYPT_RUNTIME_SECRET'] ?? getenv('DUX_ENCRYPT_RUNTIME_SECRET') ?: '');
+        $secret = self::runtimeSecret($manifest);
         if ($secret === '') {
             throw new \RuntimeException('Runtime secret missing');
         }
@@ -1715,17 +1721,163 @@ final class Runtime
         return $data ^ $stream;
     }
 
+    private static function option(string $key)
+    {
+        if (array_key_exists($key, self::$config)) {
+            return self::$config[$key];
+        }
+
+        return match ($key) {
+            'runtime_secret' => (string) ($_SERVER['DUX_ENCRYPT_RUNTIME_SECRET'] ?? getenv('DUX_ENCRYPT_RUNTIME_SECRET') ?: ''),
+            'cache_dir' => (string) ($_SERVER['DUX_ENCRYPT_CACHE_DIR'] ?? getenv('DUX_ENCRYPT_CACHE_DIR') ?: ''),
+            'ephemeral_cache' => $_SERVER['DUX_ENCRYPT_EPHEMERAL_CACHE'] ?? getenv('DUX_ENCRYPT_EPHEMERAL_CACHE') ?: '',
+            'project_id' => (string) ($_SERVER['DUX_ENCRYPT_PROJECT_ID'] ?? getenv('DUX_ENCRYPT_PROJECT_ID') ?: ''),
+            default => null,
+        };
+    }
+
+    private static function runtimeSecret(array $manifest = []): string
+    {
+        $secret = self::option('runtime_secret');
+        if (is_string($secret) && $secret !== '') {
+            return $secret;
+        }
+
+        $secrets = self::$config['runtime_secrets'] ?? null;
+        if (is_array($secrets)) {
+            $projectName = (string) ($manifest['project_name'] ?? '');
+            if ($projectName !== '' && is_string($secrets[$projectName] ?? null) && $secrets[$projectName] !== '') {
+                return $secrets[$projectName];
+            }
+            $buildId = (string) ($manifest['build_id'] ?? '');
+            if ($buildId !== '' && is_string($secrets[$buildId] ?? null) && $secrets[$buildId] !== '') {
+                return $secrets[$buildId];
+            }
+        }
+
+        $resolver = self::$config['runtime_secret_resolver'] ?? null;
+        if (is_callable($resolver)) {
+            $resolved = $resolver($manifest);
+            if (is_string($resolved) && $resolved !== '') {
+                return $resolved;
+            }
+        }
+
+        return '';
+    }
+
+    private static function cacheDir(): string
+    {
+        $base = self::option('cache_dir');
+        if (!is_string($base) || $base === '') {
+            return sys_get_temp_dir() . '/dux-encrypt-cache';
+        }
+
+        return $base;
+    }
+
+    private static function ephemeralCacheEnabled(): bool
+    {
+        $value = self::option('ephemeral_cache');
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        return (string) $value !== '';
+    }
+
+    private static function projectId(): string
+    {
+        $value = self::option('project_id');
+        return is_string($value) ? $value : '';
+    }
+
+    private static function resolveLicensePath(string $manifestPath, array $license): string
+    {
+        $path = trim((string) ($license['path'] ?? ''));
+        if ($path === '') {
+            return '';
+        }
+
+        $resolver = self::$config['license_path_resolver'] ?? null;
+        if (is_callable($resolver)) {
+            $resolved = $resolver($path, $manifestPath, $license);
+            if (is_string($resolved) && $resolved !== '') {
+                return $resolved;
+            }
+        }
+
+        if (preg_match('/^[a-zA-Z]:[\\\\\\/]/', $path) === 1 || $path[0] === '/' || strpos($path, '://') !== false) {
+            return $path;
+        }
+
+        if (strpos($path, './') === 0 || strpos($path, '../') === 0) {
+            return dirname($manifestPath) . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $path);
+        }
+
+        $base = self::$config['license_base_dir'] ?? null;
+        if (!is_string($base) || $base === '') {
+            $base = getcwd() ?: dirname(dirname($manifestPath));
+        }
+
+        return rtrim($base, '/\\') . DIRECTORY_SEPARATOR . ltrim(str_replace('\\', '/', $path), '/\\');
+    }
+
+    private static function loadLicense(array $license, string $manifestPath): array
+    {
+        if (is_array($license['payload'] ?? null)) {
+            return $license;
+        }
+
+        $path = self::resolveLicensePath($manifestPath, $license);
+        if ($path === '') {
+            return $license;
+        }
+        if (!is_file($path)) {
+            if (($license['required'] ?? false) === true) {
+                throw new \RuntimeException('License file missing');
+            }
+            return $license;
+        }
+
+        $document = json_decode((string) file_get_contents($path), true);
+        if (!is_array($document) || !is_array($document['payload'] ?? null)) {
+            throw new \RuntimeException('License file invalid');
+        }
+
+        $license['payload'] = $document['payload'];
+        $license['signature'] = (string) ($document['signature'] ?? ($license['signature'] ?? ''));
+        $license['public_key'] = (string) ($license['public_key'] ?? ($document['public_key'] ?? ''));
+        $license['__resolved_path'] = $path;
+
+        return $license;
+    }
+
+    private static function currentHost(): string
+    {
+        $host = (string) ($_SERVER['HTTP_HOST'] ?? '');
+        if ($host === '') {
+            return '';
+        }
+
+        $parts = explode(':', $host, 2);
+        return strtolower($parts[0]);
+    }
+
+    private static function currentServerIp(): string
+    {
+        foreach (['SERVER_ADDR', 'LOCAL_ADDR', 'REMOTE_ADDR'] as $key) {
+            if (!empty($_SERVER[$key])) {
+                return (string) $_SERVER[$key];
+            }
+        }
+
+        return '';
+    }
+
     private static function verifyLicense(string $manifestPath, array $manifest): void
     {
         if (($manifest['__has_license'] ?? false) !== true) {
-            return;
-        }
-
-        $projectId = (string)($_SERVER['DUX_ENCRYPT_PROJECT_ID'] ?? getenv('DUX_ENCRYPT_PROJECT_ID') ?: '');
-        $host = (string)($_SERVER['HTTP_HOST'] ?? '');
-        $cacheKey = $manifestPath . '|' . $projectId . '|' . $host . '|' . (string)($manifest['__license_cache_seed'] ?? '');
-        $now = time();
-        if (isset(self::$licenseCache[$cacheKey]) && self::$licenseCache[$cacheKey] >= $now) {
             return;
         }
 
@@ -1733,21 +1885,53 @@ final class Runtime
 			'license' => [],
 		];
         $license = $manifest['license'] ?: [];
-        if (!$license || !is_array($license) || !is_array($license['payload'])) {
+        if (!$license || !is_array($license)) {
             return;
         }
+
+        $license = self::loadLicense($license, $manifestPath);
 
         $license += [
 			'public_key' => '',
 			'signature' => '',
+            'required' => false,
 		];
+        if (!is_array($license['payload'] ?? null)) {
+            if ($license['required'] || ($license['path'] ?? '')) {
+                throw new \RuntimeException('License payload missing');
+            }
+            return;
+        }
 
+        $signedPayload = $license['payload'];
         $payload = $license['payload'];
         $payload += [
 			'expires_at' => '',
+            'not_before' => '',
 			'project_id' => '',
 			'domain_whitelist' => [],
+            'domains' => [],
+            'constraint' => [],
 		];
+
+        $projectId = self::projectId();
+        $host = self::currentHost();
+        $cacheVersion = (string) ($manifest['__license_cache_seed'] ?? '');
+        if (($license['__resolved_path'] ?? '') && is_file($license['__resolved_path'])) {
+            $cacheVersion .= '|' . (string) @filemtime($license['__resolved_path']) . '|' . (string) @filesize($license['__resolved_path']);
+        }
+        $cacheKey = $manifestPath . '|' . $projectId . '|' . $host . '|' . $cacheVersion;
+        $now = time();
+        if (isset(self::$licenseCache[$cacheKey]) && self::$licenseCache[$cacheKey] >= $now) {
+            return;
+        }
+
+        if ($payload['not_before']) {
+            $notBefore = strtotime((string) $payload['not_before']);
+            if ($notBefore !== false && $notBefore > time()) {
+                throw new \RuntimeException('License not active yet');
+            }
+        }
 
         if ($payload['expires_at']) {
             $expiresAt = strtotime((string)$payload['expires_at']);
@@ -1768,8 +1952,28 @@ final class Runtime
             }
         }
 
+        if ($payload['domains'] && is_array($payload['domains'])) {
+            if ($host && !in_array($host, $payload['domains'], true)) {
+                throw new \RuntimeException('License domain binding mismatch');
+            }
+        }
+
+        if (is_array($payload['constraint'])) {
+            $type = (string) ($payload['constraint']['type'] ?? '');
+            $value = trim((string) ($payload['constraint']['value'] ?? ''));
+            if ($type === 'domain' && $value !== '' && $host !== '' && $host !== strtolower($value)) {
+                throw new \RuntimeException('License domain binding mismatch');
+            }
+            if ($type === 'ip' && $value !== '') {
+                $serverIp = self::currentServerIp();
+                if ($serverIp !== '' && $serverIp !== $value) {
+                    throw new \RuntimeException('License ip binding mismatch');
+                }
+            }
+        }
+
         if ($license['public_key'] && $license['signature'] && function_exists('sodium_crypto_sign_verify_detached')) {
-            $message = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            $message = json_encode($signedPayload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
             $signature = base64_decode((string)$license['signature'], true);
             $publicKey = base64_decode((string)$license['public_key'], true);
             if (!$message || !$signature || !$publicKey || !sodium_crypto_sign_verify_detached($signature, $message, $publicKey)) {
