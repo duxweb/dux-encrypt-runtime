@@ -1727,13 +1727,7 @@ final class Runtime
             return self::$config[$key];
         }
 
-        return match ($key) {
-            'runtime_secret' => (string) ($_SERVER['DUX_ENCRYPT_RUNTIME_SECRET'] ?? getenv('DUX_ENCRYPT_RUNTIME_SECRET') ?: ''),
-            'cache_dir' => (string) ($_SERVER['DUX_ENCRYPT_CACHE_DIR'] ?? getenv('DUX_ENCRYPT_CACHE_DIR') ?: ''),
-            'ephemeral_cache' => $_SERVER['DUX_ENCRYPT_EPHEMERAL_CACHE'] ?? getenv('DUX_ENCRYPT_EPHEMERAL_CACHE') ?: '',
-            'project_id' => (string) ($_SERVER['DUX_ENCRYPT_PROJECT_ID'] ?? getenv('DUX_ENCRYPT_PROJECT_ID') ?: ''),
-            default => null,
-        };
+        return null;
     }
 
     private static function runtimeSecret(array $manifest = []): string
