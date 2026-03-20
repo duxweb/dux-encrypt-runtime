@@ -15,6 +15,7 @@ final class Runtime
     private static array $jitFunctionCache = [];
     private static array $jitLicenseFreeCache = [];
     private static array $functionInvokerCache = [];
+    private static array $directFunctionInvokerCache = [];
     private static array $staticInvokerCache = [];
     private static array $methodInvokerCache = [];
     private static bool $guardChecked = false;
@@ -66,6 +67,40 @@ final class Runtime
         return $invoker($scope);
     }
 
+    public static function directFunctionInvoker(string $manifestPath, string $payloadId): callable
+    {
+        $cacheKey = $manifestPath . '::direct::' . $payloadId;
+        if (isset(self::$directFunctionInvokerCache[$cacheKey])) {
+            return self::$directFunctionInvokerCache[$cacheKey];
+        }
+
+        $manifest = self::manifest($manifestPath);
+        self::verifyLicense($manifestPath, $manifest);
+        $program = self::loadProgram($manifest, $manifestPath, $payloadId);
+        self::hydrateVmProgram($program, $payloadId);
+
+        if (($program['engine'] ?: 'source') == 'jitphp') {
+            $function = self::ensureJitFunction($program, $manifestPath, $payloadId);
+            $inner = static fn (...$args) => $function(...$args);
+        } else {
+            $inner = function (...$args) use ($manifestPath, $payloadId) {
+                return self::invokeFunctionSegment($manifestPath, $payloadId, $args);
+            };
+        }
+
+        if (($manifest['__has_license'] ?? false) === true) {
+            $invoker = function (...$args) use ($manifestPath, $manifest, $inner) {
+                self::verifyLicense($manifestPath, $manifest);
+                return $inner(...$args);
+            };
+        } else {
+            $invoker = $inner;
+        }
+
+        self::$directFunctionInvokerCache[$cacheKey] = $invoker;
+        return $invoker;
+    }
+
     public static function segment(string $manifestPath, string $payloadId, int $mode = 0, array $scope = [], string $scopeClass = '', ?object $boundObject = null, string $lateStaticClass = '', string $gatePayloadId = '', array $directArgs = [])
     {
         if ($gatePayloadId !== '') {
@@ -73,7 +108,7 @@ final class Runtime
         }
 
         if ($mode === 1) {
-            $invoker = self::functionInvoker($manifestPath, $payloadId);
+            $invoker = self::directFunctionInvoker($manifestPath, $payloadId);
             return $invoker(...$directArgs);
         }
         if ($mode === 2) {
