@@ -17,6 +17,7 @@ final class Runtime
     private static array $functionInvokerCache = [];
     private static array $staticInvokerCache = [];
     private static array $methodInvokerCache = [];
+    private static bool $guardChecked = false;
 
     public static function execute(string $manifestPath, string $payloadId, string $currentFile)
     {
@@ -25,12 +26,7 @@ final class Runtime
         $program = self::loadProgram($manifest, $manifestPath, $payloadId);
         self::hydrateVmProgram($program, $payloadId);
         if (($program['engine'] ?: 'source') == 'vm') {
-            if (($program['vm_ir']['generator'] ?? false) === true) {
-                $scope = [];
-                return self::evaluateVmGenerator($program['vm_ir'] ?: [], $scope);
-            }
-            $scope = [];
-            return self::finalizeVmResult(self::evaluateVm($program['vm_ir'] ?: [], $scope));
+            return self::executeVmProgram($program, []);
         }
         if (($program['engine'] ?: 'source') == 'jitphp') {
             return self::executeJitProgram($program, $manifestPath, $payloadId, []);
@@ -70,6 +66,29 @@ final class Runtime
         return $invoker($scope);
     }
 
+    public static function segment(string $manifestPath, string $payloadId, int $mode = 0, array $scope = [], string $scopeClass = '', ?object $boundObject = null, string $lateStaticClass = '', string $gatePayloadId = '', array $directArgs = [])
+    {
+        if ($gatePayloadId !== '') {
+            self::licenseGate($manifestPath, $gatePayloadId);
+        }
+
+        if ($mode === 1) {
+            $invoker = self::functionInvoker($manifestPath, $payloadId);
+            return $invoker(...$directArgs);
+        }
+        if ($mode === 2) {
+            return self::invokeFunctionSegment($manifestPath, $payloadId, $scope);
+        }
+        if ($mode === 3) {
+            return self::invokeStaticSegment($manifestPath, $payloadId, $scope, $scopeClass, $lateStaticClass);
+        }
+        if ($mode === 4) {
+            return self::invokeSegment($manifestPath, $payloadId, $scope, $scopeClass, $boundObject, $lateStaticClass);
+        }
+
+        return self::execute($manifestPath, $payloadId, '');
+    }
+
     public static function licenseGate(string $manifestPath, string $payloadId = ''): void
     {
         if ($payloadId === '') {
@@ -83,14 +102,8 @@ final class Runtime
     private static function buildFunctionInvoker(array $program, string $manifestPath, string $payloadId)
     {
         if (($program['engine'] ?: 'source') == 'vm') {
-            $vm = $program['vm_ir'] ?: [];
-            if (($vm['generator'] ?? false) === true) {
-                return function (array $scope = []) use ($vm) {
-                    return self::evaluateVmGenerator($vm, $scope);
-                };
-            }
-            return function (array $scope = []) use ($vm) {
-                return self::finalizeVmResult(self::evaluateVm($vm, $scope));
+            return function (array $scope = []) use ($program) {
+                return self::executeVmProgram($program, $scope);
             };
         }
         if (($program['engine'] ?: 'source') == 'jitphp') {
@@ -117,12 +130,8 @@ final class Runtime
         self::hydrateVmProgram($program, $payloadId);
 
         if (($program['engine'] ?: 'source') == 'vm') {
-            $vm = $program['vm_ir'] ?: [];
-            $inner = function (array $scope = []) use ($vm) {
-                if (($vm['generator'] ?? false) === true) {
-                    return self::evaluateVmGenerator($vm, $scope);
-                }
-                return self::finalizeVmResult(self::evaluateVm($vm, $scope));
+            $inner = function (array $scope = []) use ($program) {
+                return self::executeVmProgram($program, $scope);
             };
         } elseif (($program['engine'] ?: 'source') == 'jitphp') {
             $function = self::ensureJitFunction($program, $manifestPath, $payloadId);
@@ -166,12 +175,8 @@ final class Runtime
         self::hydrateVmProgram($program, $payloadId);
 
         if (($program['engine'] ?: 'source') == 'vm') {
-            $vm = $program['vm_ir'] ?: [];
-            $inner = function (array $scope = []) use ($vm) {
-                if (($vm['generator'] ?? false) === true) {
-                    return self::evaluateVmGenerator($vm, $scope);
-                }
-                return self::finalizeVmResult(self::evaluateVm($vm, $scope));
+            $inner = function (array $scope = []) use ($program) {
+                return self::executeVmProgram($program, $scope);
             };
         } elseif (($program['engine'] ?: 'source') == 'jitphp') {
             $function = self::ensureJitFunction($program, $manifestPath, $payloadId);
@@ -224,10 +229,7 @@ final class Runtime
         self::hydrateVmProgram($program, $payloadId);
 
         if (($program['engine'] ?: 'source') == 'vm') {
-            if (($program['vm_ir']['generator'] ?? false) === true) {
-                return self::evaluateVmGenerator($program['vm_ir'] ?: [], $scope);
-            }
-            return self::finalizeVmResult(self::evaluateVm($program['vm_ir'] ?: [], $scope));
+            return self::executeVmProgram($program, $scope);
         }
         if (($program['engine'] ?: 'source') == 'jitphp') {
             return self::executeJitProgram($program, $manifestPath, $payloadId, $scope, $scopeClass);
@@ -264,10 +266,7 @@ final class Runtime
         self::hydrateVmProgram($program, $payloadId);
 
         if (($program['engine'] ?: 'source') == 'vm') {
-            if (($program['vm_ir']['generator'] ?? false) === true) {
-                return self::evaluateVmGenerator($program['vm_ir'] ?: [], $scope);
-            }
-            return self::finalizeVmResult(self::evaluateVm($program['vm_ir'] ?: [], $scope));
+            return self::executeVmProgram($program, $scope);
         }
         if (($program['engine'] ?: 'source') == 'jitphp') {
             return self::executeJitProgram($program, $manifestPath, $payloadId, $scope, $scopeClass, $boundObject);
@@ -307,9 +306,30 @@ final class Runtime
         if ($raw === false) {
             throw new \RuntimeException('Invalid ciphertext payload');
         }
-        $program = json_decode($raw, true);
-        if (!is_array($program)) {
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded)) {
             throw new \RuntimeException('Invalid program payload');
+        }
+        if (($decoded['v'] ?? '') === 'payload-v2') {
+            $payloadCiphertext = (string) ($decoded['d'] ?? '');
+            if ($payloadCiphertext === '') {
+                throw new \RuntimeException('Encrypted program payload missing');
+            }
+            $payloadKey = self::resolvePayloadKey($manifest);
+            if ($payloadKey === '') {
+                throw new \RuntimeException('Payload key missing');
+            }
+            $payload = self::decryptChunk($payloadCiphertext, $payloadKey, $payloadId . ':program');
+            $checksum = (string) ($decoded['h'] ?? '');
+            if ($checksum !== '' && !hash_equals($checksum, hash('sha256', $payload))) {
+                throw new \RuntimeException('Program payload checksum mismatch');
+            }
+            $program = json_decode($payload, true);
+            if (!is_array($program)) {
+                throw new \RuntimeException('Invalid encrypted program payload');
+            }
+        } else {
+            $program = $decoded;
         }
         $program = self::normalizeProgram($program);
         self::$programCache[$cacheKey] = $program;
@@ -350,24 +370,38 @@ final class Runtime
         if (($program['engine'] ?: 'source') != 'vm') {
             return;
         }
-        if (is_array($program['vm_ir'] ?? null)) {
-            return;
+        if (!is_array($program['vm_ir'] ?? null)) {
+            $ciphertext = (string)($program['vm_ciphertext'] ?? '');
+            if ($ciphertext == '') {
+                throw new \RuntimeException('VM payload missing');
+            }
+            $json = self::decryptChunk($ciphertext, $program['__payload_key'], $payloadId . ':vm');
+            $checksum = (string)($program['vm_checksum'] ?? '');
+            if ($checksum != '' && !hash_equals($checksum, hash('sha256', $json))) {
+                throw new \RuntimeException('VM payload checksum mismatch');
+            }
+            $vm = json_decode($json, true);
+            if (!is_array($vm)) {
+                throw new \RuntimeException('Invalid VM payload');
+            }
+            $program['vm_ir'] = $vm;
+            unset($program['vm_ciphertext']);
         }
-        $ciphertext = (string)($program['vm_ciphertext'] ?? '');
-        if ($ciphertext == '') {
-            throw new \RuntimeException('VM payload missing');
+
+        if (!is_array($program['vm_consts'] ?? null) && (string) ($program['vm_const_ciphertext'] ?? '') !== '') {
+            $constJson = self::decryptChunk((string) $program['vm_const_ciphertext'], $program['__payload_key'], $payloadId . ':vmconst');
+            $constChecksum = (string) ($program['vm_const_checksum'] ?? '');
+            if ($constChecksum != '' && !hash_equals($constChecksum, hash('sha256', $constJson))) {
+                throw new \RuntimeException('VM const payload checksum mismatch');
+            }
+            $consts = json_decode($constJson, true);
+            if (!is_array($consts)) {
+                throw new \RuntimeException('Invalid VM const payload');
+            }
+            $program['vm_consts'] = $consts;
+            unset($program['vm_const_ciphertext']);
         }
-        $json = self::decryptChunk($ciphertext, $program['__payload_key'], $payloadId . ':vm');
-        $checksum = (string)($program['vm_checksum'] ?? '');
-        if ($checksum != '' && !hash_equals($checksum, hash('sha256', $json))) {
-            throw new \RuntimeException('VM payload checksum mismatch');
-        }
-        $vm = json_decode($json, true);
-        if (!is_array($vm)) {
-            throw new \RuntimeException('Invalid VM payload');
-        }
-        $program['vm_ir'] = $vm;
-        unset($program['vm_ciphertext']);
+
         if (isset($program['__payload_key'], $program['__cache_key'])) {
             unset($program['__payload_key']);
             self::$programCache[$program['__cache_key']] = $program;
@@ -441,6 +475,12 @@ final class Runtime
         if (isset($program['y'])) {
             $program['vm_ciphertext'] = $program['y'];
         }
+        if (isset($program['u'])) {
+            $program['vm_const_checksum'] = $program['u'];
+        }
+        if (isset($program['w'])) {
+            $program['vm_const_ciphertext'] = $program['w'];
+        }
         if (isset($program['z'])) {
             $program['vm_ir'] = $program['z'];
         }
@@ -454,6 +494,20 @@ final class Runtime
             $program['jit_ciphertext'] = $program['k'];
         }
         return $program;
+    }
+
+    private static function executeVmProgram(array $program, array $scope = [])
+    {
+        if (is_array($program['vm_consts'] ?? null)) {
+            $scope['__dux_vm_consts'] = $program['vm_consts'];
+        }
+        if (is_array($program['type_map'] ?? null)) {
+            $scope['__dux_vm_type_map'] = $program['type_map'];
+        }
+        if (($program['vm_ir']['generator'] ?? false) === true) {
+            return self::evaluateVmGenerator($program['vm_ir'] ?: [], $scope);
+        }
+        return self::finalizeVmResult(self::evaluateVm($program['vm_ir'] ?: [], $scope));
     }
 
     private static function jitCachePath(string $manifestPath, string $payloadId, array $program): string
@@ -538,6 +592,7 @@ final class Runtime
 
     private static function manifest(string $manifestPath): array
     {
+        self::guardRuntime();
         if (!isset(self::$manifestCache[$manifestPath])) {
             $manifest = require $manifestPath;
             if (!is_array($manifest)) {
@@ -550,6 +605,25 @@ final class Runtime
             self::$manifestCache[$manifestPath] = $manifest;
         }
         return self::$manifestCache[$manifestPath];
+    }
+
+    private static function guardRuntime(): void
+    {
+        if (self::$guardChecked) {
+            return;
+        }
+
+        foreach (['xdebug', 'uopz', 'runkit', 'runkit7'] as $extension) {
+            if (\extension_loaded($extension)) {
+                throw new \RuntimeException('Unsupported runtime extension detected');
+            }
+        }
+
+        if (\function_exists('xdebug_info') || \function_exists('uopz_set_return')) {
+            throw new \RuntimeException('Unsupported debug runtime detected');
+        }
+
+        self::$guardChecked = true;
     }
 
     private static function verifyManifestIntegrity(array $manifest): void
@@ -631,7 +705,25 @@ final class Runtime
 
     private static function evaluateVm(array $node, array &$scope)
     {
-        $type = $node['type'] ?: '';
+        $type = self::vmType((string) ($node['type'] ?? ''), $scope);
+        if ($type == 'flat_block') {
+            $states = [];
+            foreach ($node['states'] ?: [] as $state) {
+                if (is_array($state) && ($state['id'] ?? '') != '') {
+                    $states[$state['id']] = $state;
+                }
+            }
+            $current = isset($node['entry_expr']) ? self::evaluateVmExpr($node['entry_expr'], $scope) : ($node['entry'] ?? null);
+            while ($current !== null && isset($states[$current])) {
+                $state = $states[$current];
+                $result = self::evaluateVm($state['body'] ?: ['type' => 'noop'], $scope);
+                if (is_array($result) && ($result['__dux_ctrl'] ?? '') != '') {
+                    return $result;
+                }
+                $current = isset($state['next_expr']) ? self::evaluateVmExpr($state['next_expr'], $scope) : ($state['next'] ?? null);
+            }
+            return null;
+        }
         if ($type == 'block') {
             foreach ($node['instructions'] ?: [] as $instruction) {
                 $result = self::evaluateVm($instruction, $scope);
@@ -935,7 +1027,25 @@ final class Runtime
 
     private static function iterateVmGenerator(array $node, array &$scope): \Generator
     {
-        $type = $node['type'] ?: '';
+        $type = self::vmType((string) ($node['type'] ?? ''), $scope);
+        if ($type == 'flat_block') {
+            $states = [];
+            foreach ($node['states'] ?: [] as $state) {
+                if (is_array($state) && ($state['id'] ?? '') != '') {
+                    $states[$state['id']] = $state;
+                }
+            }
+            $current = isset($node['entry_expr']) ? self::evaluateVmExpr($node['entry_expr'], $scope) : ($node['entry'] ?? null);
+            while ($current !== null && isset($states[$current])) {
+                $state = $states[$current];
+                $result = yield from self::iterateVmGenerator($state['body'] ?: ['type' => 'noop'], $scope);
+                if (is_array($result) && ($result['__dux_ctrl'] ?? '') != '') {
+                    return $result;
+                }
+                $current = isset($state['next_expr']) ? self::evaluateVmExpr($state['next_expr'], $scope) : ($state['next'] ?? null);
+            }
+            return null;
+        }
         if ($type == 'block') {
             foreach ($node['instructions'] ?: [] as $instruction) {
                 $result = yield from self::iterateVmGenerator($instruction, $scope);
@@ -1089,7 +1199,15 @@ final class Runtime
 
     private static function evaluateVmExpr(array $expr, array &$scope)
     {
-        $type = $expr['type'] ?: '';
+        $type = self::vmType((string) ($expr['type'] ?? ''), $scope);
+        if ($type == 'pool_ref') {
+            $consts = is_array($scope['__dux_vm_consts'] ?? null) ? $scope['__dux_vm_consts'] : [];
+            $item = $consts[$expr['index'] ?? -1] ?? null;
+            if (!is_array($item)) {
+                return null;
+            }
+            return self::decodeVmConst($item);
+        }
         if ($type == 'null') {
             return null;
         }
@@ -1510,6 +1628,40 @@ final class Runtime
             return $result['value'];
         }
         return null;
+    }
+
+    private static function decodeVmConst(array $item)
+    {
+        $type = (string) ($item['type'] ?? '');
+        if ($type == 'literal') {
+            return $item['value'] ?? null;
+        }
+        if ($type == 'string_xor_chunks') {
+            $parts = is_array($item['parts'] ?? null) ? $item['parts'] : [];
+            if (($item['reverse'] ?? false) === true) {
+                $parts = array_reverse($parts);
+            }
+            $value = '';
+            foreach ($parts as $part) {
+                if (!is_array($part)) {
+                    continue;
+                }
+                $mask = (int) ($part['m'] ?? 0);
+                $data = base64_decode((string) ($part['d'] ?? ''), true);
+                if ($mask <= 0 || $data === false) {
+                    continue;
+                }
+                $value .= $data ^ str_repeat(chr($mask), strlen($data));
+            }
+            return $value;
+        }
+        return $item['value'] ?? null;
+    }
+
+    private static function vmType(string $type, array $scope): string
+    {
+        $map = is_array($scope['__dux_vm_type_map'] ?? null) ? $scope['__dux_vm_type_map'] : [];
+        return (string) ($map[$type] ?? $type);
     }
 
     private static function matchCatchType(\Throwable $exception, array $types, array $scope): bool
