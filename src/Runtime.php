@@ -14,8 +14,11 @@ final class Runtime
     private static array $jitLoaded = [];
     private static array $jitFunctionCache = [];
     private static array $jitLicenseFreeCache = [];
+    private static array $jitBundleLoaded = [];
     private static array $functionInvokerCache = [];
     private static array $directFunctionInvokerCache = [];
+    private static array $directStaticInvokerCache = [];
+    private static array $directMethodInvokerCache = [];
     private static array $staticInvokerCache = [];
     private static array $methodInvokerCache = [];
     private static bool $guardChecked = false;
@@ -99,6 +102,215 @@ final class Runtime
 
         self::$directFunctionInvokerCache[$cacheKey] = $invoker;
         return $invoker;
+    }
+
+    public static function directJitFunction(string $manifestPath, string $payloadId): string
+    {
+        $cacheKey = $manifestPath . '::' . $payloadId;
+        if (isset(self::$jitFunctionCache[$cacheKey])) {
+            return self::$jitFunctionCache[$cacheKey];
+        }
+
+        $manifest = self::manifest($manifestPath);
+        $program = self::loadProgram($manifest, $manifestPath, $payloadId);
+        self::hydrateVmProgram($program, $payloadId);
+        if (($program['engine'] ?: 'source') != 'jitphp') {
+            throw new \RuntimeException('Direct JIT function is only available for jitphp payloads');
+        }
+
+        return self::ensureJitFunction($program, $manifestPath, $payloadId);
+    }
+
+    public static function loadJitFunction(string $manifestPath, string $payloadId): void
+    {
+        self::directJitFunction($manifestPath, $payloadId);
+    }
+
+    /**
+     * @param array<int, string> $payloadIds
+     */
+    public static function loadJitFunctions(string $manifestPath, array $payloadIds): void
+    {
+        $payloadIds = array_values(array_unique(array_filter($payloadIds, static fn ($payloadId) => is_string($payloadId) && $payloadId !== '')));
+        if ($payloadIds === []) {
+            return;
+        }
+        $cacheKey = $manifestPath . '::bundle::' . sha1(implode(':', $payloadIds));
+        if (isset(self::$jitBundleLoaded[$cacheKey])) {
+            return;
+        }
+
+        $manifest = self::manifest($manifestPath);
+        $licenseFree = (($manifest['__has_license'] ?? false) !== true);
+        foreach ($payloadIds as $payloadId) {
+            $functionCacheKey = $manifestPath . '::' . $payloadId;
+            self::$jitFunctionCache[$functionCacheKey] = '__dux_exec_' . $payloadId;
+            self::$jitLicenseFreeCache[$functionCacheKey] = $licenseFree;
+        }
+
+        $bundleMeta = $manifest['jit_bundles'][sha1(implode(':', $payloadIds))] ?? null;
+        if (is_array($bundleMeta)) {
+            try {
+                self::ensureJitBundle($manifestPath, $manifest, $bundleMeta);
+                self::$jitBundleLoaded[$cacheKey] = true;
+                return;
+            } catch (\Throwable) {
+                // Fall back to individual payload loading when bundle artifacts are unavailable.
+            }
+        }
+
+        $bundleSources = [];
+        $bundleCacheKeys = [];
+        $bundleSignature = [];
+        foreach ($payloadIds as $payloadId) {
+            $program = self::loadProgram($manifest, $manifestPath, $payloadId);
+            if (($program['engine'] ?: 'source') !== 'jitphp') {
+                continue;
+            }
+            $function = '__dux_exec_' . $payloadId;
+            $payloadCacheKey = self::jitCachePath($manifestPath, $payloadId, $program);
+            if (function_exists($function)) {
+                self::$jitLoaded[$payloadCacheKey] = true;
+                continue;
+            }
+
+            $bundleSources[] = self::decodeJitSource($program, $payloadId);
+            $bundleCacheKeys[] = $payloadCacheKey;
+            $bundleSignature[] = $payloadId . ':' . (string) ($program['jit_checksum'] ?? '');
+        }
+
+        if ($bundleSources !== []) {
+            $bundlePath = self::jitBundleCachePath($manifestPath, $bundleSignature);
+            if (!isset(self::$jitLoaded[$bundlePath])) {
+                self::writeJitCache($bundlePath, self::buildJitBundleCode($bundleSources));
+                if (self::canCompileJitCache()) {
+                    @opcache_compile_file($bundlePath);
+                }
+                require_once $bundlePath;
+                if (self::ephemeralCacheEnabled()) {
+                    @unlink($bundlePath);
+                }
+                self::$jitLoaded[$bundlePath] = true;
+            }
+            foreach ($bundleCacheKeys as $bundleCacheKey) {
+                self::$jitLoaded[$bundleCacheKey] = true;
+            }
+        }
+
+        self::$jitBundleLoaded[$cacheKey] = true;
+    }
+
+    public static function callFunction(string $manifestPath, string $payloadId, string $gatePayloadId = '', ...$args)
+    {
+        if ($gatePayloadId !== '') {
+            self::licenseGate($manifestPath, $gatePayloadId);
+        }
+
+        $invoker = self::directFunctionInvoker($manifestPath, $payloadId);
+        return $invoker(...$args);
+    }
+
+    public static function directStaticInvoker(string $manifestPath, string $payloadId, string $scopeClass): callable
+    {
+        $cacheKey = $manifestPath . '::direct-static::' . $payloadId . '::' . $scopeClass;
+        if (isset(self::$directStaticInvokerCache[$cacheKey])) {
+            return self::$directStaticInvokerCache[$cacheKey];
+        }
+
+        $manifest = self::manifest($manifestPath);
+        self::verifyLicense($manifestPath, $manifest);
+        $program = self::loadProgram($manifest, $manifestPath, $payloadId);
+        self::hydrateVmProgram($program, $payloadId);
+
+        if (($program['engine'] ?: 'source') == 'jitphp' && ($program['jit_args_mode'] ?? '') === 'direct') {
+            $function = self::ensureJitFunction($program, $manifestPath, $payloadId);
+            $inner = static function (string $lateStaticClass = '', ...$args) use ($function, $scopeClass, $program) {
+                $callArgs = $args;
+                if (self::jitNeedsLsbClass($program)) {
+                    $callArgs[] = $lateStaticClass ?: $scopeClass;
+                }
+                return $function(...$callArgs);
+            };
+        } else {
+            $inner = function (string $lateStaticClass = '', ...$args) use ($manifestPath, $payloadId, $scopeClass) {
+                return self::invokeStaticSegment($manifestPath, $payloadId, $args, $scopeClass, $lateStaticClass ?: $scopeClass);
+            };
+        }
+
+        if (($manifest['__has_license'] ?? false) === true) {
+            $invoker = function (string $lateStaticClass = '', ...$args) use ($manifestPath, $manifest, $inner) {
+                self::verifyLicense($manifestPath, $manifest);
+                return $inner($lateStaticClass, ...$args);
+            };
+        } else {
+            $invoker = $inner;
+        }
+
+        self::$directStaticInvokerCache[$cacheKey] = $invoker;
+        return $invoker;
+    }
+
+    public static function callStatic(string $manifestPath, string $payloadId, string $scopeClass, string $lateStaticClass = '', string $gatePayloadId = '', ...$args)
+    {
+        if ($gatePayloadId !== '') {
+            self::licenseGate($manifestPath, $gatePayloadId);
+        }
+
+        $invoker = self::directStaticInvoker($manifestPath, $payloadId, $scopeClass);
+        return $invoker($lateStaticClass, ...$args);
+    }
+
+    public static function directMethodInvoker(string $manifestPath, string $payloadId, string $scopeClass): callable
+    {
+        $cacheKey = $manifestPath . '::direct-method::' . $payloadId . '::' . $scopeClass;
+        if (isset(self::$directMethodInvokerCache[$cacheKey])) {
+            return self::$directMethodInvokerCache[$cacheKey];
+        }
+
+        $manifest = self::manifest($manifestPath);
+        self::verifyLicense($manifestPath, $manifest);
+        $program = self::loadProgram($manifest, $manifestPath, $payloadId);
+        self::hydrateVmProgram($program, $payloadId);
+
+        if (($program['engine'] ?: 'source') == 'jitphp' && ($program['jit_args_mode'] ?? '') === 'direct') {
+            $function = self::ensureJitFunction($program, $manifestPath, $payloadId);
+            $inner = static function (?object $boundObject, string $lateStaticClass = '', ...$args) use ($function, $scopeClass, $program) {
+                $callArgs = $args;
+                if (self::jitNeedsBoundObjectArg($program)) {
+                    $callArgs[] = $boundObject;
+                }
+                if (self::jitNeedsLsbClass($program)) {
+                    $callArgs[] = $lateStaticClass ?: ($boundObject ? get_class($boundObject) : $scopeClass);
+                }
+                return $function(...$callArgs);
+            };
+        } else {
+            $inner = function (?object $boundObject, string $lateStaticClass = '', ...$args) use ($manifestPath, $payloadId, $scopeClass) {
+                return self::invokeSegment($manifestPath, $payloadId, $args, $scopeClass, $boundObject, $lateStaticClass ?: ($boundObject ? get_class($boundObject) : $scopeClass));
+            };
+        }
+
+        if (($manifest['__has_license'] ?? false) === true) {
+            $invoker = function (?object $boundObject, string $lateStaticClass = '', ...$args) use ($manifestPath, $manifest, $inner) {
+                self::verifyLicense($manifestPath, $manifest);
+                return $inner($boundObject, $lateStaticClass, ...$args);
+            };
+        } else {
+            $invoker = $inner;
+        }
+
+        self::$directMethodInvokerCache[$cacheKey] = $invoker;
+        return $invoker;
+    }
+
+    public static function callMethod(string $manifestPath, string $payloadId, string $scopeClass, ?object $boundObject = null, string $lateStaticClass = '', string $gatePayloadId = '', ...$args)
+    {
+        if ($gatePayloadId !== '') {
+            self::licenseGate($manifestPath, $gatePayloadId);
+        }
+
+        $invoker = self::directMethodInvoker($manifestPath, $payloadId, $scopeClass);
+        return $invoker($boundObject, $lateStaticClass, ...$args);
     }
 
     public static function segment(string $manifestPath, string $payloadId, int $mode = 0, array $scope = [], string $scopeClass = '', ?object $boundObject = null, string $lateStaticClass = '', string $gatePayloadId = '', array $directArgs = [])
@@ -419,6 +631,9 @@ final class Runtime
             if (!is_array($vm)) {
                 throw new \RuntimeException('Invalid VM payload');
             }
+            if (is_array($program['field_map'] ?? null) && $program['field_map'] !== []) {
+                $vm = self::decodeVmFields($vm, $program['field_map']);
+            }
             $program['vm_ir'] = $vm;
             unset($program['vm_ciphertext']);
         }
@@ -437,6 +652,14 @@ final class Runtime
             unset($program['vm_const_ciphertext']);
         }
 
+        if (is_array($program['vm_ir'] ?? null)) {
+            self::validateVmGraph(
+                $program['vm_ir'],
+                is_array($program['vm_consts'] ?? null) ? $program['vm_consts'] : [],
+                is_array($program['type_map'] ?? null) ? $program['type_map'] : []
+            );
+        }
+
         if (isset($program['__payload_key'], $program['__cache_key'])) {
             unset($program['__payload_key']);
             self::$programCache[$program['__cache_key']] = $program;
@@ -453,16 +676,11 @@ final class Runtime
     {
         $function = '__dux_exec_' . $payloadId;
         $cachePath = self::jitCachePath($manifestPath, $payloadId, $program);
+        if (function_exists($function)) {
+            self::$jitLoaded[$cachePath] = true;
+        }
         if (!isset(self::$jitLoaded[$cachePath])) {
-            $ciphertext = (string)($program['jit_ciphertext'] ?? '');
-            if ($ciphertext == '') {
-                throw new \RuntimeException('JIT payload missing');
-            }
-            $code = self::decryptChunk($ciphertext, $program['__payload_key'], $payloadId . ':jit');
-            $checksum = (string)($program['jit_checksum'] ?? '');
-            if ($checksum != '' && !hash_equals($checksum, hash('sha256', $code))) {
-                throw new \RuntimeException('JIT payload checksum mismatch');
-            }
+            $code = self::decodeJitSource($program, $payloadId);
             self::writeJitCache($cachePath, $code);
             if (self::canCompileJitCache()) {
                 @opcache_compile_file($cachePath);
@@ -477,6 +695,75 @@ final class Runtime
         self::$jitFunctionCache[$functionCacheKey] = $function;
         self::$jitLicenseFreeCache[$functionCacheKey] = ((self::manifest($manifestPath)['__has_license'] ?? false) !== true);
         return $function;
+    }
+
+    /**
+     * @param array<string, mixed> $manifest
+     * @param array<string, mixed> $bundleMeta
+     */
+    private static function ensureJitBundle(string $manifestPath, array $manifest, array $bundleMeta): void
+    {
+        $bundleId = (string) ($bundleMeta['id'] ?? '');
+        if ($bundleId === '') {
+            throw new \RuntimeException('JIT bundle metadata missing');
+        }
+        $bundlePath = self::jitBundleCachePath($manifestPath, [$bundleId]);
+        if (!isset(self::$jitLoaded[$bundlePath])) {
+            $code = self::decodeJitBundle($manifestPath, $manifest, $bundleId);
+            self::writeJitCache($bundlePath, $code);
+            if (self::canCompileJitCache()) {
+                @opcache_compile_file($bundlePath);
+            }
+            require_once $bundlePath;
+            if (self::ephemeralCacheEnabled()) {
+                @unlink($bundlePath);
+            }
+            self::$jitLoaded[$bundlePath] = true;
+        }
+    }
+
+    private static function decodeJitSource(array $program, string $payloadId): string
+    {
+        $ciphertext = (string)($program['jit_ciphertext'] ?? '');
+        if ($ciphertext == '') {
+            throw new \RuntimeException('JIT payload missing');
+        }
+        $code = self::decryptChunk($ciphertext, $program['__payload_key'], $payloadId . ':jit');
+        $checksum = (string)($program['jit_checksum'] ?? '');
+        if ($checksum != '' && !hash_equals($checksum, hash('sha256', $code))) {
+            throw new \RuntimeException('JIT payload checksum mismatch');
+        }
+        return $code;
+    }
+
+    /**
+     * @param array<string, mixed> $manifest
+     */
+    private static function decodeJitBundle(string $manifestPath, array $manifest, string $bundleId): string
+    {
+        $bundleFile = dirname($manifestPath) . '/bundles/' . $bundleId . '.bin';
+        $ciphertext = trim((string) file_get_contents($bundleFile));
+        if ($ciphertext === '') {
+            throw new \RuntimeException('JIT bundle missing');
+        }
+        $raw = base64_decode($ciphertext, true);
+        if ($raw === false) {
+            throw new \RuntimeException('Invalid JIT bundle payload');
+        }
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded)) {
+            throw new \RuntimeException('Invalid JIT bundle payload');
+        }
+        $payloadKey = self::resolvePayloadKey($manifest);
+        if ($payloadKey === '') {
+            throw new \RuntimeException('Payload key missing');
+        }
+        $code = self::decryptChunk((string) ($decoded['d'] ?? ''), $payloadKey, $bundleId . ':jitbundle');
+        $checksum = (string) ($decoded['h'] ?? '');
+        if ($checksum !== '' && !hash_equals($checksum, hash('sha256', $code))) {
+            throw new \RuntimeException('JIT bundle checksum mismatch');
+        }
+        return $code;
     }
 
     private static function invokeLoadedJitFunction(string $function, array $scope, string $scopeClass = '', ?object $boundObject = null)
@@ -522,13 +809,120 @@ final class Runtime
         if (isset($program['p'])) {
             $program['jit_args_mode'] = $program['p'];
         }
+        if (isset($program['n'])) {
+            $program['jit_meta_mask'] = $program['n'];
+        }
         if (isset($program['j'])) {
             $program['jit_checksum'] = $program['j'];
         }
         if (isset($program['k'])) {
             $program['jit_ciphertext'] = $program['k'];
         }
+        if (isset($program['field_map'])) {
+            $program['field_map'] = is_array($program['field_map']) ? $program['field_map'] : [];
+        }
         return $program;
+    }
+
+    /**
+     * @param array<int|string, mixed> $value
+     * @param array<string, string> $fieldMap
+     * @return array<int|string, mixed>
+     */
+    private static function decodeVmFields(array $value, array $fieldMap): array
+    {
+        $assoc = array_keys($value) !== range(0, count($value) - 1);
+        if (!$assoc) {
+            foreach ($value as $key => $item) {
+                if (is_array($item)) {
+                    $value[$key] = self::decodeVmFields($item, $fieldMap);
+                }
+            }
+            return $value;
+        }
+
+        $result = [];
+        foreach ($value as $key => $item) {
+            $mappedKey = is_string($key) ? ($fieldMap[$key] ?? $key) : $key;
+            if (is_array($item)) {
+                $result[$mappedKey] = self::decodeVmFields($item, $fieldMap);
+            } else {
+                $result[$mappedKey] = $item;
+            }
+        }
+        return $result;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $consts
+     * @param array<string, string> $typeMap
+     */
+    private static function validateVmGraph(array $node, array $consts, array $typeMap): void
+    {
+        $token = (string) ($node['type'] ?? '');
+        $type = (string) ($typeMap[$token] ?? $token);
+        if ($type === 'flat_block') {
+            $salt = (string) self::resolveVmStaticValue($node['salt_expr'] ?? [], $consts, $typeMap);
+            foreach (($node['states'] ?? []) as $state) {
+                if (!is_array($state)) {
+                    continue;
+                }
+                $key = (string) self::resolveVmStaticValue($state['key_expr'] ?? [], $consts, $typeMap);
+                $guard = (string) self::resolveVmStaticValue($state['guard_expr'] ?? [], $consts, $typeMap);
+                if ($key === '' || $guard === '' || !hash_equals(self::vmFlatBlockGuard($salt, $key), $guard)) {
+                    throw new \RuntimeException('VM graph integrity check failed');
+                }
+                if (is_array($state['body'] ?? null)) {
+                    self::validateVmGraph($state['body'], $consts, $typeMap);
+                }
+            }
+        } elseif ($type === 'block') {
+            foreach (($node['instructions'] ?? []) as $instruction) {
+                if (is_array($instruction)) {
+                    self::validateVmGraph($instruction, $consts, $typeMap);
+                }
+            }
+        }
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $consts
+     */
+    private static function resolveVmStaticValue(array $expr, array $consts, array $typeMap)
+    {
+        $token = (string) ($expr['type'] ?? '');
+        $type = (string) ($typeMap[$token] ?? $token);
+        if ($type === 'pool_ref') {
+            $item = $consts[$expr['index'] ?? -1] ?? null;
+            return is_array($item) ? self::decodeVmConst($item) : null;
+        }
+        if (in_array($type, ['string', 'int', 'float', 'bool'], true)) {
+            return $expr['value'] ?? null;
+        }
+        if ($type === 'null') {
+            return null;
+        }
+        return null;
+    }
+
+    private static function vmFlatBlockGuard(string $salt, string $key): string
+    {
+        return substr(hash('sha256', $salt . ':' . $key), 0, 20);
+    }
+
+    private static function jitMetaMask(array $program): int
+    {
+        return (int)($program['jit_meta_mask'] ?? 0);
+    }
+
+    private static function jitNeedsLsbClass(array $program): bool
+    {
+        return (self::jitMetaMask($program) & 4) !== 0;
+    }
+
+    private static function jitNeedsBoundObjectArg(array $program): bool
+    {
+        return (self::jitMetaMask($program) & 9) !== 0;
     }
 
     private static function executeVmProgram(array $program, array $scope = [])
@@ -552,6 +946,25 @@ final class Runtime
             @mkdir($base, 0700, true);
         }
         $digest = hash('sha256', $manifestPath . ':' . $payloadId . ':' . (string)($program['jit_checksum'] ?? ''));
+        if (self::ephemeralCacheEnabled()) {
+            $digest .= '-' . (string) getmypid();
+        }
+        return rtrim($base, '/\\') . DIRECTORY_SEPARATOR . substr($digest, 0, 40) . '.php';
+    }
+
+    /**
+     * @param array<int, string> $signature
+     */
+    private static function jitBundleCachePath(string $manifestPath, array $signature): string
+    {
+        $base = self::cacheDir();
+        if (!is_dir($base)) {
+            @mkdir($base, 0700, true);
+        }
+        $digest = hash('sha256', $manifestPath . ':bundle:' . implode('|', $signature));
+        if (self::ephemeralCacheEnabled()) {
+            $digest .= '-' . (string) getmypid();
+        }
         return rtrim($base, '/\\') . DIRECTORY_SEPARATOR . substr($digest, 0, 40) . '.php';
     }
 
@@ -582,6 +995,30 @@ final class Runtime
         }
         file_put_contents($path, $code, LOCK_EX);
         @chmod($path, 0600);
+    }
+
+    /**
+     * @param array<int, string> $sources
+     */
+    private static function buildJitBundleCode(array $sources): string
+    {
+        $buffer = [
+            '<?php',
+            'declare(strict_types=1);',
+            '',
+        ];
+        foreach ($sources as $source) {
+            $buffer[] = self::normalizeJitBundleSource($source);
+            $buffer[] = '';
+        }
+        return implode("\n", $buffer);
+    }
+
+    private static function normalizeJitBundleSource(string $source): string
+    {
+        $source = preg_replace('/^\s*<\?php\s*/', '', $source, 1) ?: $source;
+        $source = preg_replace('/^\s*declare\s*\(\s*strict_types\s*=\s*1\s*\)\s*;\s*/', '', $source, 1) ?: $source;
+        return ltrim($source);
     }
 
     public static function scopeArgs(array $scope): array
@@ -742,12 +1179,7 @@ final class Runtime
     {
         $type = self::vmType((string) ($node['type'] ?? ''), $scope);
         if ($type == 'flat_block') {
-            $states = [];
-            foreach ($node['states'] ?: [] as $state) {
-                if (is_array($state) && ($state['id'] ?? '') != '') {
-                    $states[$state['id']] = $state;
-                }
-            }
+            $states = self::vmFlatBlockStates($node, $scope);
             $current = isset($node['entry_expr']) ? self::evaluateVmExpr($node['entry_expr'], $scope) : ($node['entry'] ?? null);
             while ($current !== null && isset($states[$current])) {
                 $state = $states[$current];
@@ -816,7 +1248,7 @@ final class Runtime
         }
         if ($type == 'static_assign') {
             $class = self::resolveVmClassRef($node['class'], $scope);
-            self::writeStaticProperty($class, $node['name'], self::evaluateVmExpr($node['expr'] ?: [], $scope));
+            self::writeStaticProperty($class, $node['name'], self::evaluateVmExpr($node['expr'] ?: [], $scope), (string)($scope['__dux_scope_class'] ?? ''));
             return null;
         }
         if ($type == 'static_array_assign') {
@@ -825,12 +1257,12 @@ final class Runtime
             foreach ($node['dims'] ?: [] as $dim) {
                 $dims[] = self::evaluateVmExpr($dim, $scope);
             }
-            $current = self::readStaticProperty($class, $node['name']);
+            $current = self::readStaticProperty($class, $node['name'], (string)($scope['__dux_scope_class'] ?? ''));
             if (!is_array($current)) {
                 $current = [];
             }
             $current = self::writeArrayPath($current, $dims, self::evaluateVmExpr($node['expr'] ?: [], $scope));
-            self::writeStaticProperty($class, $node['name'], $current);
+            self::writeStaticProperty($class, $node['name'], $current, (string)($scope['__dux_scope_class'] ?? ''));
             return null;
         }
         if ($type == 'property_array_assign') {
@@ -842,12 +1274,12 @@ final class Runtime
             foreach ($node['dims'] ?: [] as $dim) {
                 $dims[] = self::evaluateVmExpr($dim, $scope);
             }
-            $current = self::readObjectProperty($object, $node['name']);
+            $current = self::readObjectProperty($object, $node['name'], (string)($scope['__dux_scope_class'] ?? ''));
             if (!is_array($current)) {
                 $current = [];
             }
             $current = self::writeArrayPath($current, $dims, self::evaluateVmExpr($node['expr'] ?: [], $scope));
-            self::writeObjectProperty($object, $node['name'], $current);
+            self::writeObjectProperty($object, $node['name'], $current, (string)($scope['__dux_scope_class'] ?? ''));
             return null;
         }
         if ($type == 'property_assign') {
@@ -855,7 +1287,7 @@ final class Runtime
             if (!is_object($object)) {
                 throw new \RuntimeException('Property assignment target is not object');
             }
-            self::writeObjectProperty($object, $node['name'], self::evaluateVmExpr($node['expr'] ?: [], $scope));
+            self::writeObjectProperty($object, $node['name'], self::evaluateVmExpr($node['expr'] ?: [], $scope), (string)($scope['__dux_scope_class'] ?? ''));
             return null;
         }
         if ($type == 'expr') {
@@ -1028,9 +1460,9 @@ final class Runtime
                         $dims[] = self::evaluateVmExpr($dim, $scope);
                     }
                     $class = self::resolveVmClassRef($target['class'], $scope);
-                    $value = self::readStaticProperty($class, $target['name']);
+                    $value = self::readStaticProperty($class, $target['name'], (string)($scope['__dux_scope_class'] ?? ''));
                     if (is_array($value)) {
-                        self::writeStaticProperty($class, $target['name'], self::unsetArrayPath($value, $dims));
+                        self::writeStaticProperty($class, $target['name'], self::unsetArrayPath($value, $dims), (string)($scope['__dux_scope_class'] ?? ''));
                     }
                     continue;
                 }
@@ -1041,9 +1473,9 @@ final class Runtime
                     }
                     $object = $target['object'] == 'this' ? ($scope['__dux_bound_object'] ?? null) : self::evaluateVmExpr($target['object'], $scope);
                     if (is_object($object)) {
-                        $value = self::readObjectProperty($object, $target['name']);
+                        $value = self::readObjectProperty($object, $target['name'], (string)($scope['__dux_scope_class'] ?? ''));
                         if (is_array($value)) {
-                            self::writeObjectProperty($object, $target['name'], self::unsetArrayPath($value, $dims));
+                            self::writeObjectProperty($object, $target['name'], self::unsetArrayPath($value, $dims), (string)($scope['__dux_scope_class'] ?? ''));
                         }
                     }
                 }
@@ -1051,6 +1483,26 @@ final class Runtime
             return null;
         }
         throw new \RuntimeException('Unsupported vm node');
+    }
+
+    private static function vmFlatBlockStates(array $node, array &$scope): array
+    {
+        $states = [];
+        foreach (($node['states'] ?? []) as $state) {
+            if (!is_array($state)) {
+                continue;
+            }
+            $key = '';
+            if (is_array($state['key_expr'] ?? null)) {
+                $key = (string) self::evaluateVmExpr($state['key_expr'], $scope);
+            } elseif (($state['id'] ?? '') !== '') {
+                $key = (string) $state['id'];
+            }
+            if ($key !== '') {
+                $states[$key] = $state;
+            }
+        }
+        return $states;
     }
 
     private static function evaluateVmGenerator(array $node, array $scope): \Generator
@@ -1064,12 +1516,7 @@ final class Runtime
     {
         $type = self::vmType((string) ($node['type'] ?? ''), $scope);
         if ($type == 'flat_block') {
-            $states = [];
-            foreach ($node['states'] ?: [] as $state) {
-                if (is_array($state) && ($state['id'] ?? '') != '') {
-                    $states[$state['id']] = $state;
-                }
-            }
+            $states = self::vmFlatBlockStates($node, $scope);
             $current = isset($node['entry_expr']) ? self::evaluateVmExpr($node['entry_expr'], $scope) : ($node['entry'] ?? null);
             while ($current !== null && isset($states[$current])) {
                 $state = $states[$current];
@@ -1304,17 +1751,17 @@ final class Runtime
         if ($type == 'static_assign_expr') {
             $value = self::evaluateVmExpr($expr['expr'], $scope);
             $class = self::resolveVmClassRef($expr['class'], $scope);
-            self::writeStaticProperty($class, $expr['name'], $value);
+            self::writeStaticProperty($class, $expr['name'], $value, (string)($scope['__dux_scope_class'] ?? ''));
             return $value;
         }
         if ($type == 'coalesce_assign_static') {
             $class = self::resolveVmClassRef($expr['class'], $scope);
-            $current = self::readStaticProperty($class, $expr['name']);
+            $current = self::readStaticProperty($class, $expr['name'], (string)($scope['__dux_scope_class'] ?? ''));
             if ($current !== null) {
                 return $current;
             }
             $value = self::evaluateVmExpr($expr['expr'], $scope);
-            self::writeStaticProperty($class, $expr['name'], $value);
+            self::writeStaticProperty($class, $expr['name'], $value, (string)($scope['__dux_scope_class'] ?? ''));
             return $value;
         }
         if ($type == 'property_assign_expr') {
@@ -1323,7 +1770,7 @@ final class Runtime
             if (!is_object($object)) {
                 throw new \RuntimeException('Property assignment target is not object');
             }
-            self::writeObjectProperty($object, $expr['name'], $value);
+            self::writeObjectProperty($object, $expr['name'], $value, (string)($scope['__dux_scope_class'] ?? ''));
             return $value;
         }
         if ($type == 'coalesce_assign_property') {
@@ -1331,12 +1778,12 @@ final class Runtime
             if (!is_object($object)) {
                 throw new \RuntimeException('Property assignment target is not object');
             }
-            $current = self::readObjectProperty($object, $expr['name']);
+            $current = self::readObjectProperty($object, $expr['name'], (string)($scope['__dux_scope_class'] ?? ''));
             if ($current !== null) {
                 return $current;
             }
             $value = self::evaluateVmExpr($expr['expr'], $scope);
-            self::writeObjectProperty($object, $expr['name'], $value);
+            self::writeObjectProperty($object, $expr['name'], $value, (string)($scope['__dux_scope_class'] ?? ''));
             return $value;
         }
         if ($type == 'pre_inc') {
@@ -1367,14 +1814,14 @@ final class Runtime
             $prop = $expr['name'];
             return (function () use ($object, $prop) {
                 return $object->$prop;
-            })->bindTo($object, get_class($object))();
+            })->bindTo($object, (string)($scope['__dux_scope_class'] ?? get_class($object)))();
         }
         if ($type == 'property_fetch_expr') {
             $object = self::evaluateVmExpr($expr['object'], $scope);
             if (!is_object($object)) {
                 throw new \RuntimeException('Property fetch target is not object');
             }
-            return self::readObjectProperty($object, $expr['name']);
+            return self::readObjectProperty($object, $expr['name'], (string)($scope['__dux_scope_class'] ?? ''));
         }
         if ($type == 'nullsafe_property_fetch') {
             $object = self::evaluateVmExpr($expr['object'], $scope);
@@ -1384,7 +1831,7 @@ final class Runtime
             if (!is_object($object)) {
                 throw new \RuntimeException('Nullsafe property target is not object');
             }
-            return self::readObjectProperty($object, $expr['name']);
+            return self::readObjectProperty($object, $expr['name'], (string)($scope['__dux_scope_class'] ?? ''));
         }
         if ($type == 'concat') {
             return (string)self::evaluateVmExpr($expr['left'], $scope) . (string)self::evaluateVmExpr($expr['right'], $scope);
@@ -1468,7 +1915,7 @@ final class Runtime
         }
         if ($type == 'static_array_fetch') {
             $class = self::resolveVmClassRef($expr['class'], $scope);
-            $value = self::readStaticProperty($class, $expr['name']);
+            $value = self::readStaticProperty($class, $expr['name'], (string)($scope['__dux_scope_class'] ?? ''));
             if (!is_array($value)) {
                 return null;
             }
@@ -1483,7 +1930,7 @@ final class Runtime
             if (!is_object($object)) {
                 return null;
             }
-            $value = self::readObjectProperty($object, $expr['name']);
+            $value = self::readObjectProperty($object, $expr['name'], (string)($scope['__dux_scope_class'] ?? ''));
             if (!is_array($value)) {
                 return null;
             }
@@ -1594,7 +2041,7 @@ final class Runtime
                 throw new \RuntimeException('Method call target is not object');
             }
             $method = $expr['method'];
-            return self::invokeObjectMethod($target, $method, $args);
+            return self::invokeObjectMethod($target, $method, $args, (string)($scope['__dux_scope_class'] ?? ''));
         }
         if ($type == 'method_call_expr') {
             $target = self::evaluateVmExpr($expr['target'], $scope);
@@ -1602,7 +2049,7 @@ final class Runtime
                 throw new \RuntimeException('Method call target is not object');
             }
             $args = self::evaluateCallArgs($expr['args'], $scope);
-            return self::invokeObjectMethod($target, $expr['method'], $args);
+            return self::invokeObjectMethod($target, $expr['method'], $args, (string)($scope['__dux_scope_class'] ?? ''));
         }
         if ($type == 'nullsafe_method_call') {
             $target = self::evaluateVmExpr($expr['target'], $scope);
@@ -1613,21 +2060,21 @@ final class Runtime
                 throw new \RuntimeException('Nullsafe method target is not object');
             }
             $args = self::evaluateCallArgs($expr['args'], $scope);
-            return self::invokeObjectMethod($target, $expr['method'], $args);
+            return self::invokeObjectMethod($target, $expr['method'], $args, (string)($scope['__dux_scope_class'] ?? ''));
         }
         if ($type == 'static_call') {
             $args = self::evaluateCallArgs($expr['args'], $scope);
             $class = self::resolveVmClassRef($expr['class'], $scope);
-            return $class::{$expr['method']}(...$args);
+            return self::invokeStaticMethod($class, $expr['method'], $args, (string)($scope['__dux_scope_class'] ?? ''));
         }
         if ($type == 'static_property_fetch') {
             $class = self::resolveVmClassRef($expr['class'], $scope);
             $name = $expr['name'];
-            return self::readStaticProperty($class, $name);
+            return self::readStaticProperty($class, $name, (string)($scope['__dux_scope_class'] ?? ''));
         }
         if ($type == 'class_const_fetch') {
             $class = self::resolveVmClassRef($expr['class'], $scope);
-            return self::readClassConst($class, $expr['name']);
+            return self::readClassConst($class, $expr['name'], (string)($scope['__dux_scope_class'] ?? ''));
         }
         if ($type == 'class_name') {
             return self::resolveVmClassRef($expr['class'], $scope);
@@ -1746,32 +2193,35 @@ final class Runtime
         }
     }
 
-    private static function invokeObjectMethod(object $target, string $method, array $args)
+    private static function invokeObjectMethod(object $target, string $method, array $args, string $scopeClass = '')
     {
         $ref = new \ReflectionMethod($target, $method);
         if ($ref->isPublic() || $ref->getDeclaringClass()->isInternal()) {
             return $target->{$method}(...$args);
         }
+        $bindClass = $scopeClass !== '' ? $scopeClass : get_class($target);
         $call = function () use ($target, $method, $args) {
             return $target->{$method}(...$args);
         };
-        return $call->bindTo($target, get_class($target))();
+        return $call->bindTo($target, $bindClass)();
     }
 
-    private static function readObjectProperty(object $object, string $name)
+    private static function readObjectProperty(object $object, string $name, string $scopeClass = '')
     {
+        $bindClass = $scopeClass !== '' ? $scopeClass : get_class($object);
         $reader = function () use ($object, $name) {
             return $object->$name;
         };
-        return $reader->bindTo($object, get_class($object))();
+        return $reader->bindTo($object, $bindClass)();
     }
 
-    private static function writeObjectProperty(object $object, string $name, $value): void
+    private static function writeObjectProperty(object $object, string $name, $value, string $scopeClass = ''): void
     {
+        $bindClass = $scopeClass !== '' ? $scopeClass : get_class($object);
         $writer = function () use ($object, $name, $value) {
             $object->$name = $value;
         };
-        $writer->bindTo($object, get_class($object))();
+        $writer->bindTo($object, $bindClass)();
     }
 
     private static function readArrayPath(array $value, array $dims)
@@ -1876,28 +2326,44 @@ final class Runtime
         return self::resolveVmClass($class, $scope);
     }
 
-    private static function readStaticProperty(string $class, string $name)
+    private static function readStaticProperty(string $class, string $name, string $scopeClass = '')
     {
+        $bindClass = $scopeClass !== '' ? $scopeClass : $class;
         $reader = function () use ($name) {
             return self::$$name;
         };
-        return \Closure::bind($reader, null, $class)();
+        return \Closure::bind($reader, null, $bindClass)();
     }
 
-    private static function writeStaticProperty(string $class, string $name, $value): void
+    private static function writeStaticProperty(string $class, string $name, $value, string $scopeClass = ''): void
     {
+        $bindClass = $scopeClass !== '' ? $scopeClass : $class;
         $writer = function () use ($name, $value) {
             self::$$name = $value;
         };
-        \Closure::bind($writer, null, $class)();
+        \Closure::bind($writer, null, $bindClass)();
     }
 
-    private static function readClassConst(string $class, string $name)
+    private static function readClassConst(string $class, string $name, string $scopeClass = '')
     {
+        $bindClass = $scopeClass !== '' ? $scopeClass : $class;
         $reader = function () use ($name) {
-            return constant('self::' . $name);
+            return constant($class . '::' . $name);
         };
-        return \Closure::bind($reader, null, $class)();
+        return \Closure::bind($reader, null, $bindClass)();
+    }
+
+    private static function invokeStaticMethod(string $class, string $method, array $args, string $scopeClass = '')
+    {
+        $ref = new \ReflectionMethod($class, $method);
+        if ($ref->isPublic() || $ref->getDeclaringClass()->isInternal()) {
+            return $class::{$method}(...$args);
+        }
+        $bindClass = $scopeClass !== '' ? $scopeClass : $class;
+        $call = static function () use ($class, $method, $args) {
+            return $class::{$method}(...$args);
+        };
+        return \Closure::bind($call, null, $bindClass)();
     }
 
     private static function decryptChunk(string $ciphertext, string $key, string $seed): string
