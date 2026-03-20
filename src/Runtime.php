@@ -6,7 +6,6 @@ namespace DuxEncrypt;
 
 final class Runtime
 {
-    private static array $config = [];
     private static array $manifestCache = [];
     private static array $programCache = [];
     private static array $payloadKeyCache = [];
@@ -18,11 +17,6 @@ final class Runtime
     private static array $functionInvokerCache = [];
     private static array $staticInvokerCache = [];
     private static array $methodInvokerCache = [];
-
-    public static function configure(array $config): void
-    {
-        self::$config = array_replace_recursive(self::$config, $config);
-    }
 
     public static function execute(string $manifestPath, string $payloadId, string $currentFile)
     {
@@ -75,6 +69,17 @@ final class Runtime
         $invoker = self::functionInvoker($manifestPath, $payloadId);
         return $invoker($scope);
     }
+
+    public static function licenseGate(string $manifestPath, string $payloadId = ''): void
+    {
+        if ($payloadId === '') {
+            return;
+        }
+
+        $invoker = self::functionInvoker($manifestPath, $payloadId);
+        $invoker([]);
+    }
+
     private static function buildFunctionInvoker(array $program, string $manifestPath, string $payloadId)
     {
         if (($program['engine'] ?: 'source') == 'vm') {
@@ -538,6 +543,7 @@ final class Runtime
             if (!is_array($manifest)) {
                 throw new \RuntimeException('Invalid manifest');
             }
+            $manifest['__manifest_path'] = $manifestPath;
             self::verifyManifestIntegrity($manifest);
             $manifest['__license_cache_seed'] = sha1(json_encode($manifest['license'] ?? [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '');
             $manifest['__has_license'] = is_array($manifest['license'] ?? null) && $manifest['license'] !== [];
@@ -558,7 +564,7 @@ final class Runtime
             throw new \RuntimeException('Runtime secret missing');
         }
         $payload = $manifest;
-        unset($payload['manifest_hmac'], $payload['manifest_hmac_salt']);
+        unset($payload['manifest_hmac'], $payload['manifest_hmac_salt'], $payload['__manifest_path']);
         $expected = base64_encode(hash_hmac('sha256', self::canonicalJson($payload), $secret . ':' . $salt, true));
         if (!hash_equals($hmac, $expected)) {
             throw new \RuntimeException('Manifest integrity check failed');
@@ -1721,39 +1727,17 @@ final class Runtime
         return $data ^ $stream;
     }
 
-    private static function option(string $key)
-    {
-        if (array_key_exists($key, self::$config)) {
-            return self::$config[$key];
-        }
-
-        return null;
-    }
-
     private static function runtimeSecret(array $manifest = []): string
     {
-        $secret = self::option('runtime_secret');
-        if (is_string($secret) && $secret !== '') {
-            return $secret;
-        }
-
-        $secrets = self::$config['runtime_secrets'] ?? null;
-        if (is_array($secrets)) {
-            $projectName = (string) ($manifest['project_name'] ?? '');
-            if ($projectName !== '' && is_string($secrets[$projectName] ?? null) && $secrets[$projectName] !== '') {
-                return $secrets[$projectName];
-            }
-            $buildId = (string) ($manifest['build_id'] ?? '');
-            if ($buildId !== '' && is_string($secrets[$buildId] ?? null) && $secrets[$buildId] !== '') {
-                return $secrets[$buildId];
-            }
-        }
-
-        $resolver = self::$config['runtime_secret_resolver'] ?? null;
-        if (is_callable($resolver)) {
-            $resolved = $resolver($manifest);
-            if (is_string($resolved) && $resolved !== '') {
-                return $resolved;
+        $license = $manifest['license'] ?? null;
+        $manifestPath = (string) ($manifest['__manifest_path'] ?? '');
+        if (is_array($license) && $manifestPath !== '') {
+            $document = self::licenseDocument($license, $manifestPath);
+            if (is_array($document['payload'] ?? null)) {
+                $embedded = (string) ($document['payload']['runtime_secret'] ?? '');
+                if ($embedded !== '') {
+                    return $embedded;
+                }
             }
         }
 
@@ -1762,28 +1746,17 @@ final class Runtime
 
     private static function cacheDir(): string
     {
-        $base = self::option('cache_dir');
-        if (!is_string($base) || $base === '') {
-            return sys_get_temp_dir() . '/dux-encrypt-cache';
-        }
-
-        return $base;
+        return sys_get_temp_dir() . '/dux-encrypt-cache';
     }
 
     private static function ephemeralCacheEnabled(): bool
     {
-        $value = self::option('ephemeral_cache');
-        if (is_bool($value)) {
-            return $value;
-        }
-
-        return (string) $value !== '';
+        return true;
     }
 
     private static function projectId(): string
     {
-        $value = self::option('project_id');
-        return is_string($value) ? $value : '';
+        return '';
     }
 
     private static function resolveLicensePath(string $manifestPath, array $license): string
@@ -1791,14 +1764,6 @@ final class Runtime
         $path = trim((string) ($license['path'] ?? ''));
         if ($path === '') {
             return '';
-        }
-
-        $resolver = self::$config['license_path_resolver'] ?? null;
-        if (is_callable($resolver)) {
-            $resolved = $resolver($path, $manifestPath, $license);
-            if (is_string($resolved) && $resolved !== '') {
-                return $resolved;
-            }
         }
 
         if (preg_match('/^[a-zA-Z]:[\\\\\\/]/', $path) === 1 || $path[0] === '/' || strpos($path, '://') !== false) {
@@ -1809,10 +1774,24 @@ final class Runtime
             return dirname($manifestPath) . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $path);
         }
 
-        $base = self::$config['license_base_dir'] ?? null;
-        if (!is_string($base) || $base === '') {
-            $base = getcwd() ?: dirname(dirname($manifestPath));
+        $dir = dirname($manifestPath);
+        $candidates = [];
+        while ($dir !== '' && $dir !== '.' && !in_array($dir, $candidates, true)) {
+            $candidates[] = $dir;
+            $parent = dirname($dir);
+            if ($parent === $dir) {
+                break;
+            }
+            $dir = $parent;
         }
+        foreach ($candidates as $base) {
+            $candidate = rtrim($base, '/\\') . DIRECTORY_SEPARATOR . ltrim(str_replace('\\', '/', $path), '/\\');
+            if (is_file($candidate)) {
+                return $candidate;
+            }
+        }
+
+        $base = $candidates !== [] ? end($candidates) : (getcwd() ?: dirname(dirname($manifestPath)));
 
         return rtrim($base, '/\\') . DIRECTORY_SEPARATOR . ltrim(str_replace('\\', '/', $path), '/\\');
     }
@@ -1823,28 +1802,39 @@ final class Runtime
             return $license;
         }
 
+        $document = self::licenseDocument($license, $manifestPath);
+        if (!is_array($document['payload'] ?? null)) {
+            return $license;
+        }
+
+        $license['payload'] = $document['payload'];
+        $license['signature'] = (string) ($document['signature'] ?? ($license['signature'] ?? ''));
+        $license['public_key'] = (string) ($license['public_key'] ?? ($document['public_key'] ?? ''));
+        $license['__resolved_path'] = (string) ($document['__resolved_path'] ?? '');
+
+        return $license;
+    }
+
+    private static function licenseDocument(array $license, string $manifestPath): array
+    {
         $path = self::resolveLicensePath($manifestPath, $license);
         if ($path === '') {
-            return $license;
+            return [];
         }
         if (!is_file($path)) {
             if (($license['required'] ?? false) === true) {
                 throw new \RuntimeException('License file missing');
             }
-            return $license;
+            return [];
         }
 
         $document = json_decode((string) file_get_contents($path), true);
         if (!is_array($document) || !is_array($document['payload'] ?? null)) {
             throw new \RuntimeException('License file invalid');
         }
+        $document['__resolved_path'] = $path;
 
-        $license['payload'] = $document['payload'];
-        $license['signature'] = (string) ($document['signature'] ?? ($license['signature'] ?? ''));
-        $license['public_key'] = (string) ($license['public_key'] ?? ($document['public_key'] ?? ''));
-        $license['__resolved_path'] = $path;
-
-        return $license;
+        return $document;
     }
 
     private static function currentHost(): string
